@@ -124,10 +124,16 @@ fn install() -> bool {
         match record.ExceptionCode {
             // A page not there or not readable (or, should the destination
             // be one, not writable), a mapped file's page that could not be
-            // read, or a guard page (its guard is gone with the fault).
-            // `rep movsb` stops at the byte it could not move, with `rcx`
-            // the bytes left; the routine returns them.
+            // read, or a guard page. `rep movsb` stops at the byte it could
+            // not move, with `rcx` the bytes left; the routine returns them.
             EXCEPTION_ACCESS_VIOLATION | EXCEPTION_IN_PAGE_ERROR | STATUS_GUARD_PAGE_VIOLATION => {
+                if record.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION && record.NumberParameters >= 2 {
+                    // The fault took the page's guard away, which the title
+                    // may count on (a stack's growth, its own probes): it is
+                    // put back, and the kernel's copy after this one stops
+                    // at the page as it did before.
+                    guard_again(record.ExceptionInformation[1]);
+                }
                 context.Rip = victory_user_copy_after as *const () as u64;
                 EXCEPTION_CONTINUE_EXECUTION
             }
@@ -136,6 +142,26 @@ fn install() -> bool {
     }
     // SAFETY: the handler only acts on faults of the routine above.
     !unsafe { AddVectoredExceptionHandler(1, Some(on_fault)) }.is_null()
+}
+
+/// Makes the 4 KiB page at `at` a guard page again, as it was before a read
+/// of ours went through its guard.
+#[cfg(target_arch = "x86_64")]
+fn guard_again(at: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery,
+    };
+    let page = at & !0xfff;
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(page as *const _, &mut info, size_of_val(&info)) };
+    if n != 0 && info.State == MEM_COMMIT && info.Protect & PAGE_GUARD == 0 {
+        let mut old = 0;
+        // SAFETY: only the protection of the one page changes, back to what
+        // it was before the fault.
+        unsafe { VirtualProtect(page as *const _, 1, info.Protect | PAGE_GUARD, &mut old) };
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -147,8 +173,9 @@ fn install() -> bool {
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS,
-        PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_GUARD,
+        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+        VirtualQuery,
     };
 
     const PAGE: usize = 4096;
@@ -216,9 +243,15 @@ mod tests {
         let mut dst = vec![0u8; 2 * PAGE];
         assert!(!copy(dst.as_mut_ptr(), guarded.0.wrapping_add(2 * PAGE), 2 * PAGE));
         assert_eq!(dst[..PAGE], expected(2 * PAGE..3 * PAGE)[..]);
-        // The guard went with the fault: the page reads now.
-        assert!(copy(dst.as_mut_ptr(), guarded.0.wrapping_add(2 * PAGE), 2 * PAGE));
-        assert_eq!(dst, expected(2 * PAGE..4 * PAGE));
+        // The guard is back after the fault: the page stops a copy again,
+        // and is still a guard page.
+        assert!(!copy(dst.as_mut_ptr(), guarded.0.wrapping_add(2 * PAGE), 2 * PAGE));
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size; a page of ours.
+        let n = unsafe { VirtualQuery(guarded.0.add(3 * PAGE).cast(), &mut info, size_of_val(&info)) };
+        assert_ne!(n, 0);
+        assert_eq!(info.Protect, PAGE_READWRITE | PAGE_GUARD);
     }
 
     #[test]
