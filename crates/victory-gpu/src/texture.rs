@@ -1003,8 +1003,7 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
             // Bit 0 of the answer: the page is in the working set.
             // SAFETY: plain data the query filled in.
             let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
-            let mut byte = [0u8];
-            if valid || crate::host::read_into(((page + i) * KERNEL_PAGE) as *const u8, &mut byte) {
+            if valid || crate::host::readable_byte(((page + i) * KERNEL_PAGE) as *const u8) {
                 there += 1;
             } else if all {
                 return (there, of);

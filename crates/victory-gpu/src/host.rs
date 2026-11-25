@@ -5442,7 +5442,9 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    // Into host memory with plain loads first ([`read_plain`]); into title
+    // memory through the kernel ([`crate::usercopy`] says why).
+    let whole = if title_dst { read(src, dst, len) } else { read_plain(src, dst, len) };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -5522,7 +5524,22 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    read(src, dst.as_mut_ptr(), dst.len())
+    read_plain(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// Whether the byte at `at` can be read now, asked of the kernel: for a
+/// look at a page that is often not there, which with a plain load would
+/// go through exception dispatch each time.
+pub(crate) fn readable_byte(at: *const u8) -> bool {
+    let mut byte = 0u8;
+    read(at, &mut byte, 1)
+}
+
+/// [`read`] into host memory, with plain loads first
+/// ([`crate::usercopy`]); a range they could not finish is read again whole
+/// through the kernel, so the answer and what lands are as with [`read`].
+fn read_plain(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    crate::usercopy::copy(dst, src, len) || read(src, dst, len)
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
